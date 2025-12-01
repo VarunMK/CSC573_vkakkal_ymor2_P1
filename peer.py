@@ -3,7 +3,7 @@ import argparse
 import socket
 import threading
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import platform
 
 CRLF = "\r\n"
@@ -16,9 +16,13 @@ class P2PPeer:
         server_port=7734,
         rfc_dir=None,
         peer_name=None,
+        advertised_host='localhost',
+        default_protocol_version="PCP-CI/1.0",
     ):
         self.server_host = server_host
         self.server_port = server_port
+        self.advertised_host = advertised_host
+        self.default_protocol_version = default_protocol_version
 
         unique_name = peer_name or f"{socket.gethostname()}-{os.getpid()}"
         self.hostname = unique_name
@@ -74,38 +78,37 @@ class P2PPeer:
     def process_upload_request(self, request: str) -> str:
         lines = request.replace("\r\n", "\n").strip().split('\n')
         if not lines:
-            return f"P2P-CI/1.0 400 Bad Request{CRLF}{CRLF}"
+            return f"{self.default_protocol_version} 400 Bad Request{CRLF}{CRLF}"
 
         request_line = lines[0].split()
-        # Expect: GET RFC <num> P2P-CI/1.0
+        # Expect: GET RFC <num> <version>
         if len(request_line) < 4 or request_line[0] != "GET" or request_line[1] != "RFC":
-            return f"P2P-CI/1.0 400 Bad Request{CRLF}{CRLF}"
+            return f"{self.default_protocol_version} 400 Bad Request{CRLF}{CRLF}"
 
         try:
             rfc_num = int(request_line[2])
         except ValueError:
-            return f"P2P-CI/1.0 400 Bad Request{CRLF}{CRLF}"
+            return f"{self.default_protocol_version} 400 Bad Request{CRLF}{CRLF}"
 
         version = request_line[3]
-        if version != "P2P-CI/1.0":
-            return f"P2P-CI/1.0 505 P2P-CI Version Not Supported{CRLF}{CRLF}"
+        if version != self.default_protocol_version:
+            return f"{self.default_protocol_version} 505 PCP-CI Version Not Supported{CRLF}{CRLF}"
 
         rfc_file = os.path.join(self.rfc_dir, f"rfc{rfc_num}.txt")
         if not os.path.exists(rfc_file):
-            return f"P2P-CI/1.0 404 Not Found{CRLF}{CRLF}"
+            return f"{self.default_protocol_version} 404 Not Found{CRLF}{CRLF}"
 
         try:
             with open(rfc_file, 'r') as f:
                 content = f.read()
 
             file_size = len(content.encode('utf-8'))
-            last_modified = datetime.utcfromtimestamp(os.path.getmtime(rfc_file)).strftime(
-                '%a, %d %b %Y %H:%M:%S GMT'
-            )
-            current_time = datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+            last_mtime = datetime.fromtimestamp(os.path.getmtime(rfc_file), timezone.utc)
+            last_modified = last_mtime.strftime('%a, %d %b %Y %H:%M:%S GMT')
+            current_time = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
 
             response_lines = [
-                "P2P-CI/1.0 200 OK",
+                f"{self.default_protocol_version} 200 OK",
                 f"Date: {current_time}",
                 f"OS: {platform.system()} {platform.release()}",
                 f"Last-Modified: {last_modified}",
@@ -116,7 +119,7 @@ class P2PPeer:
             ]
             return CRLF.join(response_lines)
         except Exception:
-            return f"P2P-CI/1.0 404 Not Found{CRLF}{CRLF}"
+            return f"{self.default_protocol_version} 404 Not Found{CRLF}{CRLF}"
 
     # -----------------------------
     # Connection to central server
@@ -129,10 +132,18 @@ class P2PPeer:
     # -----------------------------
     # P2S operations: ADD / LOOKUP / LIST
     # -----------------------------
-    def add_rfc(self, rfc_num: int, title: str):
+    def add_rfc(self, rfc_num: int, version: str):
+        rfc_path = os.path.join(self.rfc_dir, f"rfc{rfc_num}.txt")
+        if not os.path.exists(rfc_path):
+            self._print_status(404, "Not Found", f"Missing file rfc{rfc_num}.txt in {self.rfc_dir}", version)
+            return
+
+        title = self.extract_rfc_title(rfc_path) or f"RFC {rfc_num}"
+
         lines = [
-            f"ADD RFC {rfc_num} P2P-CI/1.0",
-            f"Host: {self.hostname}",
+            f"ADD RFC {rfc_num} {version}",
+            f"Host: {self.advertised_host}",
+            f"Hostname: {self.hostname}",
             f"Port: {self.upload_port}",
             f"Title: {title}",
             "",
@@ -143,10 +154,11 @@ class P2PPeer:
         response = self.server_socket.recv(4096).decode('utf-8')
         print(f"ADD response: {response.strip()}")
 
-    def lookup_rfc(self, rfc_num: int) -> str:
+    def lookup_rfc(self, rfc_num: int, version: str) -> str:
         lines = [
-            f"LOOKUP RFC {rfc_num} P2P-CI/1.0",
-            f"Host: {self.hostname}",
+            f"LOOKUP RFC {rfc_num} {version}",
+            f"Host: {self.advertised_host}",
+            f"Hostname: {self.hostname}",
             f"Port: {self.upload_port}",
             "",
         ]
@@ -157,10 +169,11 @@ class P2PPeer:
         print(f"LOOKUP response:\n{response}")
         return response
 
-    def list_rfcs(self) -> str:
+    def list_rfcs(self, version: str) -> str:
         lines = [
-            "LIST ALL P2P-CI/1.0",
-            f"Host: {self.hostname}",
+            f"LIST ALL {version}",
+            f"Host: {self.advertised_host}",
+            f"Hostname: {self.hostname}",
             f"Port: {self.upload_port}",
             "",
         ]
@@ -174,25 +187,26 @@ class P2PPeer:
     # -----------------------------
     # Download from another peer
     # -----------------------------
-    def download_rfc(self, rfc_num: int, peer_host: str, peer_port: int) -> bool:
-        download_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def get_rfc(self, rfc_num: int, peer_host: str, peer_port: int, peer_name: str, version: str) -> bool:
+        get_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            download_socket.connect((peer_host, int(peer_port)))
+            get_socket.connect((peer_host, int(peer_port)))
 
             lines = [
-                f"GET RFC {rfc_num} P2P-CI/1.0",
-                f"Host: {peer_host}",
+                f"GET RFC {rfc_num} {version}",
+                f"Host: {self.advertised_host}",
+                f"Hostname: {self.hostname}",
                 f"OS: {platform.system()} {platform.release()}",
                 "",
             ]
             request = CRLF.join(lines)
 
-            download_socket.sendall(request.encode('utf-8'))
+            get_socket.sendall(request.encode('utf-8'))
 
             # Read until connection closes
             chunks = []
             while True:
-                chunk = download_socket.recv(8192)
+                chunk = get_socket.recv(8192)
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -206,7 +220,7 @@ class P2PPeer:
                 sep_len = 2
 
             if split_index == -1:
-                self._print_status(400, "Bad Request", f"Malformed response for RFC {rfc_num}")
+                self._print_status(400, "Bad Request", f"Malformed response for RFC {rfc_num}", version)
                 return False
 
             status_line = response[:split_index].splitlines()[0]
@@ -220,14 +234,14 @@ class P2PPeer:
             with open(rfc_file, 'w') as f:
                 f.write(content)
 
-            self._print_status(200, "OK", f"RFC {rfc_num} saved to {rfc_file}")
+            self._print_status(200, "OK", f"RFC {rfc_num} saved to {rfc_file} (from {peer_name})", version)
             return True
 
         except Exception as e:
-            self._print_status(400, "Bad Request", f"Download failed for RFC {rfc_num}: {e}")
+            self._print_status(400, "Bad Request", f"GET failed for RFC {rfc_num} from {peer_name}: {e}", version)
             return False
         finally:
-            download_socket.close()
+            get_socket.close()
 
     # -----------------------------
     # Helper: register local RFC files on startup
@@ -243,9 +257,7 @@ class P2PPeer:
                 except ValueError:
                     continue
 
-                filepath = os.path.join(self.rfc_dir, filename)
-                title = self.extract_rfc_title(filepath) or f"RFC {rfc_num}"
-                self.add_rfc(rfc_num, title)
+                self.add_rfc(rfc_num, self.default_protocol_version)
 
     def extract_rfc_title(self, filepath: str) -> str:
         """
@@ -279,10 +291,10 @@ class P2PPeer:
         self.register_local_rfcs()
 
         print("\nP2P Peer started. Commands:")
-        print("add <rfc_num> <title> - Add RFC to index")
-        print("lookup <rfc_num> - Find peers with RFC")
-        print("list - List all RFCs")
-        print("download <rfc_num> - Download RFC from peer")
+        print("add <rfc_num> <protocol> - Add RFC from local file using protocol token")
+        print("lookup <rfc_num> <protocol> - Find peers with RFC")
+        print("list <protocol> - List all RFCs")
+        print("get <rfc_num> <protocol> - Retrieve RFC from peer (uses the same token for LOOKUP/GET)")
         print("quit - Exit")
 
         try:
@@ -291,72 +303,76 @@ class P2PPeer:
                 if not cmd:
                     continue
 
-                if cmd[0] == "add" and len(cmd) >= 3:
+                if cmd[0] == "add":
+                    if len(cmd) != 3:
+                        self._print_status(400, "Bad Request", "Usage: add <rfc_num> <protocol>")
+                        continue
                     try:
                         rfc_num = int(cmd[1])
                     except ValueError:
                         self._print_status(400, "Bad Request", "RFC number must be integer")
                         continue
-                    title = " ".join(cmd[2:])
-                    self.add_rfc(rfc_num, title)
+                    version = cmd[2]
+                    self.add_rfc(rfc_num, version)
 
-                elif cmd[0] == "lookup" and len(cmd) == 2:
+                elif cmd[0] == "lookup" and len(cmd) == 3:
                     try:
                         rfc_num = int(cmd[1])
                     except ValueError:
                         self._print_status(400, "Bad Request", "RFC number must be integer")
                         continue
-                    self.lookup_rfc(rfc_num)
+                    version = cmd[2]
+                    self.lookup_rfc(rfc_num, version)
 
                 elif cmd[0] == "list":
-                    if len(cmd) != 1:
-                        self._print_status(400, "Bad Request", "LIST takes no arguments")
+                    if len(cmd) != 2:
+                        self._print_status(400, "Bad Request", "Usage: list <protocol>")
                         continue
-                    self.list_rfcs()
+                    version = cmd[1]
+                    self.list_rfcs(version)
 
-                elif cmd[0] == "download" and len(cmd) == 2:
+                elif cmd[0] == "get" and len(cmd) == 3:
                     try:
                         rfc_num = int(cmd[1])
                     except ValueError:
                         self._print_status(400, "Bad Request", "RFC number must be integer")
                         continue
-                    response = self.lookup_rfc(rfc_num)
+                    version = cmd[2]
+                    response = self.lookup_rfc(rfc_num, version)
 
                     status_line = self._status_line(response)
                     if "200 OK" not in status_line:
-                        self._print_status(404, "Not Found", f"RFC {rfc_num} unavailable")
+                        self._print_status(404, "Not Found", f"RFC {rfc_num} unavailable", version)
                         continue
 
                     entries = self._extract_rfc_entries(response, rfc_num)
                     if not entries:
-                        self._print_status(404, "Not Found", f"No peers hosting RFC {rfc_num}")
+                        self._print_status(404, "Not Found", f"No peers hosting RFC {rfc_num}", version)
                         continue
 
                     print("Available peers:")
                     for idx, entry in enumerate(entries, 1):
-                        _, title, host, port = entry
-                        print(f"{idx}. {title} ({host}:{port})")
+                        _, title, peer_name, host, port = entry
+                        print(f"{idx}. {title} ({peer_name} @ {host}:{port})")
 
                     selection = input("Select peer [1]: ").strip()
                     if selection:
                         try:
                             choice = int(selection)
                             if not (1 <= choice <= len(entries)):
-                                self._print_status(400, "Bad Request", "Selection out of range")
+                                self._print_status(400, "Bad Request", "Selection out of range", version)
                                 continue
                         except ValueError:
-                            self._print_status(400, "Bad Request", "Selection must be numeric")
+                            self._print_status(400, "Bad Request", "Selection must be numeric", version)
                             continue
                     else:
                         choice = 1
 
-                    _, title, peer_host, peer_port = entries[choice - 1]
+                    _, _, peer_name, peer_host, peer_port = entries[choice - 1]
 
-                    if self.download_rfc(rfc_num, peer_host, peer_port):
-                        # After download, register with server
-                        if not title:
-                            title = f"RFC {rfc_num}"
-                        self.add_rfc(rfc_num, title)
+                    if self.get_rfc(rfc_num, peer_host, peer_port, peer_name, version):
+                        # After GET, register with server
+                        self.add_rfc(rfc_num, self.default_protocol_version)
 
                 elif cmd[0] == "quit":
                     break
@@ -372,8 +388,9 @@ class P2PPeer:
             if self.upload_server_socket:
                 self.upload_server_socket.close()
 
-    def _print_status(self, code: int, phrase: str, message: str = None):
-        status_line = f"P2P-CI/1.0 {code} {phrase}"
+    def _print_status(self, code: int, phrase: str, message: str = None, version: str = None):
+        protocol = version or self.default_protocol_version
+        status_line = f"{protocol} {code} {phrase}"
         if message:
             status_line = f"{status_line}\n{message}"
         print(status_line)
@@ -391,7 +408,7 @@ class P2PPeer:
             if not line.startswith("RFC"):
                 continue
             parts = line.split()
-            if len(parts) < 5:
+            if len(parts) < 6:
                 continue
             try:
                 rfc_num = int(parts[1])
@@ -399,10 +416,11 @@ class P2PPeer:
                 continue
             if rfc_num != expected_rfc:
                 continue
-            host = parts[-2]
-            port = parts[-1]
-            title = " ".join(parts[2:-2]).strip()
-            entries.append((rfc_num, title, host, port))
+            peer_host = parts[-2]
+            peer_port = parts[-1]
+            peer_name = parts[-3]
+            title = " ".join(parts[2:-3]).strip()
+            entries.append((rfc_num, title, peer_name, peer_host, peer_port))
         return entries
 
 
@@ -423,12 +441,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rfc-dir",
         default=None,
-        help="Directory holding this peer's RFC files (default: rfcs_<hostname>-<pid>)",
+        help=(
+            "Directory holding this peer's RFC files (default: <peer-name>_rfcs if "
+            "--peer-name is supplied, otherwise <hostname>-<pid>_rfcs)."
+        ),
     )
     parser.add_argument(
         "--peer-name",
         default=None,
         help="Override hostname reported to the server (default: host-pid)",
+    )
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Actual host/IP advertised for this peer's uploads (default: localhost)",
+    )
+    parser.add_argument(
+        "--default-protocol-version",
+        default="PCP-CI/1.0",
+        help="Protocol token used for automatic requests (default: PCP-CI/1.0)",
     )
 
     args = parser.parse_args()
@@ -438,5 +469,7 @@ if __name__ == "__main__":
         server_port=args.server_port,
         rfc_dir=args.rfc_dir,
         peer_name=args.peer_name,
+        advertised_host=args.host,
+        default_protocol_version=args.default_protocol_version,
     )
     peer.run()
